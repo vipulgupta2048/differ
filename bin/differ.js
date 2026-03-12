@@ -9,16 +9,16 @@ const program = new Command();
 
 program
   .name("differ")
-  .description("Analyze git commits to see what was removed and added")
+  .description("Show what was removed and replaced in a single git commit")
   .version("1.0.0")
-  .argument("[directory]", "Git repository directory to analyze", ".")
-  .option("-n, --count <number>", "Number of commits to show", "10")
-  .option("-a, --author <name>", "Filter commits by author")
-  .option("--since <date>", "Show commits after date (e.g. 2024-01-01)")
-  .option("--until <date>", "Show commits before date")
+  .argument("<commit>", "Commit hash to analyze")
+  .argument("[directory]", "Git repository directory", ".")
   .option("-f, --file <path>", "Only show changes for a specific file")
-  .option("--stat", "Show summary statistics only (no line details)")
+  .option("--stat", "Show summary statistics only")
+  .option("--json", "Output as JSON (for piping to LLMs or other tools)")
   .action(run);
+
+// ── Helpers ──────────────────────────────────────────────────────────
 
 function git(cmd, cwd) {
   try {
@@ -36,121 +36,236 @@ function git(cmd, cwd) {
   }
 }
 
-function getCommits(cwd, opts) {
-  const args = ["log", `--max-count=${opts.count}`, "--format=%H||%an||%ai||%s"];
-  if (opts.author) args.push(`--author=${opts.author}`);
-  if (opts.since) args.push(`--since=${opts.since}`);
-  if (opts.until) args.push(`--until=${opts.until}`);
-  if (opts.file) args.push("--", opts.file);
-
-  const raw = git(args.join(" "), cwd);
-  if (!raw) return [];
-
-  return raw.split("\n").map((line) => {
-    const [hash, author, date, ...msgParts] = line.split("||");
-    return { hash, author, date, message: msgParts.join("||") };
-  });
+function getCommit(cwd, hash) {
+  const SEP = "\x1f";
+  const raw = git(`log -1 --format=%H${SEP}%an${SEP}%ae${SEP}%ai${SEP}%s${SEP}%b ${hash}`, cwd);
+  if (!raw) return null;
+  const [fullHash, author, email, date, subject, ...bodyParts] = raw.split(SEP);
+  return {
+    hash: fullHash,
+    author,
+    email,
+    date,
+    message: subject,
+    body: bodyParts.join("").trim(),
+  };
 }
 
+// ── Diff parser ──────────────────────────────────────────────────────
+// Extracts only substitutions: contiguous removed lines immediately
+// followed by contiguous added lines. Pure additions and pure
+// deletions are skipped — we only care about code that was *replaced*.
+
 function parseDiff(rawDiff) {
-  const removed = [];
-  const added = [];
+  const substitutions = [];
   let currentFile = null;
+  let hunkContext = null;
+  let pendingRemoved = [];
+  let pendingAdded = [];
+
+  function flushPending() {
+    if (pendingRemoved.length > 0 && pendingAdded.length > 0) {
+      substitutions.push({
+        file: currentFile,
+        context: hunkContext,
+        removed: [...pendingRemoved],
+        added: [...pendingAdded],
+      });
+    }
+    pendingRemoved = [];
+    pendingAdded = [];
+  }
 
   for (const line of rawDiff.split("\n")) {
     if (line.startsWith("diff --git")) {
+      flushPending();
       const match = line.match(/b\/(.+)$/);
       currentFile = match ? match[1] : "unknown";
+      hunkContext = null;
+    } else if (line.startsWith("@@")) {
+      flushPending();
+      const ctxMatch = line.match(/@@ .+? @@\s*(.+)/);
+      hunkContext = ctxMatch ? ctxMatch[1].trim() : null;
     } else if (line.startsWith("-") && !line.startsWith("---")) {
-      removed.push({ file: currentFile, content: line.slice(1) });
+      if (pendingAdded.length > 0) flushPending();
+      pendingRemoved.push(line.slice(1));
     } else if (line.startsWith("+") && !line.startsWith("+++")) {
-      added.push({ file: currentFile, content: line.slice(1) });
+      pendingAdded.push(line.slice(1));
+    } else {
+      flushPending();
     }
   }
+  flushPending();
 
-  return { removed, added };
+  return substitutions;
 }
 
-function printSection(label, items, colorFn, symbol) {
-  if (items.length === 0) return;
+// ── TUI output ───────────────────────────────────────────────────────
 
-  console.log(colorFn(`\n  ${label} (${items.length} lines):`));
+const BOX = { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" };
 
-  // Group by file
-  const byFile = {};
-  for (const item of items) {
-    const f = item.file || "unknown";
-    if (!byFile[f]) byFile[f] = [];
-    byFile[f].push(item.content);
-  }
-
-  for (const [file, lines] of Object.entries(byFile)) {
-    console.log(colorFn.bold(`    ${file}`));
-    for (const l of lines) {
-      console.log(colorFn(`      ${symbol} ${l}`));
-    }
-  }
+function fileIcon(filePath) {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  const icons = {
+    js: "◆", ts: "◇", py: "◈", rb: "◉", go: "●", rs: "◎",
+    java: "◐", css: "◑", html: "◒", json: "◓", md: "◔",
+    yml: "◕", yaml: "◕", sh: "◖", bash: "◖",
+  };
+  return icons[ext] || "◦";
 }
 
-function run(directory, opts) {
-  const cwd = path.resolve(directory);
+function boxLine(text, width) {
+  const stripped = text.replace(/\x1b\[[0-9;]*m/g, "");
+  const pad = Math.max(0, width - stripped.length - 4);
+  return `  ${BOX.v} ${text}${" ".repeat(pad)} ${BOX.v}`;
+}
 
-  // Verify it's a git repo
-  git("rev-parse --git-dir", cwd);
+function printTUI(commit, substitutions, opts) {
+  const W = Math.min(process.stdout.columns || 80, 90);
+  const inner = W - 4;
+  const shortHash = commit.hash.slice(0, 8);
+  const dateStr = commit.date.split(" ").slice(0, 2).join(" ");
 
-  const commits = getCommits(cwd, opts);
+  // Header box
+  console.log("");
+  console.log(`  ${BOX.tl}${BOX.h.repeat(inner + 2)}${BOX.tr}`);
+  console.log(boxLine(
+    `${chalk.cyan.bold(shortHash)}  ${chalk.white.bold(commit.message)}`, W
+  ));
+  console.log(boxLine(
+    chalk.dim(`${commit.author} • ${dateStr}`), W
+  ));
+  console.log(`  ${BOX.bl}${BOX.h.repeat(inner + 2)}${BOX.br}`);
 
-  if (commits.length === 0) {
-    console.log(chalk.yellow("No commits found matching your criteria."));
+  if (substitutions.length === 0) {
+    console.log(chalk.dim("\n  No substitutions — only pure additions or deletions.\n"));
     return;
   }
 
-  console.log(
-    chalk.bold(`\n📋 Showing ${commits.length} commit(s) in ${cwd}\n`)
-  );
-  console.log(chalk.dim("─".repeat(70)));
-
-  for (const commit of commits) {
-    const shortHash = commit.hash.slice(0, 8);
-    const dateStr = commit.date.split(" ").slice(0, 2).join(" ");
-
-    console.log(
-      `\n${chalk.cyan.bold(shortHash)} ${chalk.white.bold(commit.message)}`
-    );
-    console.log(
-      chalk.dim(`  ${commit.author} • ${dateStr}`)
-    );
-
-    // Get diff for this commit
-    const diffArgs = commit.hash + "^!" + (opts.file ? ` -- ${opts.file}` : "");
-    const rawDiff = git(`diff ${diffArgs}`, cwd);
-
-    if (!rawDiff) {
-      console.log(chalk.dim("  (no diff available — initial or merge commit)"));
-      console.log(chalk.dim("─".repeat(70)));
-      continue;
-    }
-
-    const { removed, added } = parseDiff(rawDiff);
-
-    if (opts.stat) {
-      console.log(
-        `  ${chalk.red(`− ${removed.length} removed`)}  ${chalk.green(`+ ${added.length} added`)}`
-      );
-    } else {
-      printSection("REMOVED", removed, chalk.red, "−");
-      printSection("ADDED", added, chalk.green, "+");
-
-      if (removed.length === 0 && added.length === 0) {
-        console.log(chalk.dim("  (no line-level changes)"));
-      }
-    }
-
-    console.log(chalk.dim("\n" + "─".repeat(70)));
+  // Stat mode
+  if (opts.stat) {
+    const totalR = substitutions.reduce((s, b) => s + b.removed.length, 0);
+    const totalA = substitutions.reduce((s, b) => s + b.added.length, 0);
+    const files = [...new Set(substitutions.map((s) => s.file))];
+    console.log("");
+    console.log(`  ${chalk.bold(substitutions.length)} substitution(s) across ${chalk.bold(files.length)} file(s)`);
+    console.log(`  ${chalk.red(`− ${totalR} lines removed`)}  ${chalk.dim("→")}  ${chalk.green(`+ ${totalA} lines added`)}`);
+    console.log("");
+    return;
   }
 
-  // Summary
+  // Group by file
+  const byFile = {};
+  for (const sub of substitutions) {
+    if (!byFile[sub.file]) byFile[sub.file] = [];
+    byFile[sub.file].push(sub);
+  }
+
+  let changeNum = 0;
+  const totalChanges = substitutions.length;
+
+  for (const [file, subs] of Object.entries(byFile)) {
+    const icon = fileIcon(file);
+    console.log(`\n  ${chalk.bold(`${icon} ${file}`)} ${chalk.dim(`(${subs.length} change${subs.length > 1 ? "s" : ""})`)}`);
+    console.log(chalk.dim(`  ${"┄".repeat(inner)}`));
+
+    for (const sub of subs) {
+      changeNum++;
+      const label = chalk.dim(`  ┌─ change ${changeNum}/${totalChanges}`);
+      if (sub.context) {
+        console.log(`${label} ${chalk.dim.italic(`in ${sub.context}`)}`);
+      } else {
+        console.log(label);
+      }
+
+      for (const l of sub.removed) {
+        console.log(chalk.red(`  │ − ${l}`));
+      }
+      console.log(chalk.yellow(`  │ ${"▼".repeat(3)}`));
+      for (const l of sub.added) {
+        console.log(chalk.green(`  │ + ${l}`));
+      }
+      console.log(chalk.dim("  └" + "┄".repeat(20)));
+    }
+  }
+
+  // Footer summary
+  const totalR = substitutions.reduce((s, b) => s + b.removed.length, 0);
+  const totalA = substitutions.reduce((s, b) => s + b.added.length, 0);
+  const files = Object.keys(byFile);
   console.log("");
+  console.log(chalk.dim("  ─".repeat(Math.floor(inner / 2))));
+  console.log(
+    `  ${chalk.bold(totalChanges)} substitution${totalChanges > 1 ? "s" : ""} in ` +
+    `${chalk.bold(files.length)} file${files.length > 1 ? "s" : ""}:  ` +
+    `${chalk.red(`−${totalR}`)} removed  ${chalk.green(`+${totalA}`)} added`
+  );
+  console.log("");
+}
+
+// ── JSON output ──────────────────────────────────────────────────────
+
+function printJSON(commit, substitutions) {
+  const byFile = {};
+  for (const sub of substitutions) {
+    if (!byFile[sub.file]) byFile[sub.file] = [];
+    byFile[sub.file].push(sub);
+  }
+
+  const output = {
+    commit: {
+      hash: commit.hash,
+      short: commit.hash.slice(0, 8),
+      message: commit.message,
+      body: commit.body || null,
+      author: { name: commit.author, email: commit.email },
+      date: commit.date,
+    },
+    summary: {
+      total_substitutions: substitutions.length,
+      total_removed_lines: substitutions.reduce((s, b) => s + b.removed.length, 0),
+      total_added_lines: substitutions.reduce((s, b) => s + b.added.length, 0),
+      files_changed: Object.keys(byFile).length,
+    },
+    files: Object.entries(byFile).map(([file, subs]) => ({
+      path: file,
+      substitutions: subs.map((s) => ({
+        context: s.context || null,
+        removed: s.removed,
+        added: s.added,
+      })),
+    })),
+  };
+
+  console.log(JSON.stringify(output, null, 2));
+}
+
+// ── Main ─────────────────────────────────────────────────────────────
+
+function run(commitHash, directory, opts) {
+  const cwd = path.resolve(directory);
+  git("rev-parse --git-dir", cwd);
+
+  const commit = getCommit(cwd, commitHash);
+  if (!commit) {
+    if (opts.json) {
+      console.log(JSON.stringify({ error: `commit ${commitHash} not found` }));
+    } else {
+      console.error(chalk.red(`Error: commit ${commitHash} not found.`));
+    }
+    process.exit(1);
+  }
+
+  const diffArgs = commit.hash + "^!" + (opts.file ? ` -- ${opts.file}` : "");
+  const rawDiff = git(`diff ${diffArgs}`, cwd);
+
+  const substitutions = rawDiff ? parseDiff(rawDiff) : [];
+
+  if (opts.json) {
+    printJSON(commit, substitutions);
+  } else {
+    printTUI(commit, substitutions, opts);
+  }
 }
 
 program.parse();
