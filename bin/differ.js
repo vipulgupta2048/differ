@@ -16,6 +16,7 @@ program
   .option("-f, --file <path>", "Only show changes for a specific file")
   .option("--stat", "Show summary statistics only")
   .option("--json", "Output as JSON (for piping to LLMs or other tools)")
+  .option("--plain", "Plain text output with no colors or box drawing (LLM-friendly)")
   .action(run);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -62,12 +63,18 @@ function parseDiff(rawDiff) {
   let hunkContext = null;
   let pendingRemoved = [];
   let pendingAdded = [];
+  let oldLine = 0;
+  let newLine = 0;
+  let removeStart = 0;
+  let addStart = 0;
 
   function flushPending() {
     if (pendingRemoved.length > 0 && pendingAdded.length > 0) {
       substitutions.push({
         file: currentFile,
         context: hunkContext,
+        removedStart: removeStart,
+        addedStart: addStart,
         removed: [...pendingRemoved],
         added: [...pendingAdded],
       });
@@ -84,15 +91,23 @@ function parseDiff(rawDiff) {
       hunkContext = null;
     } else if (line.startsWith("@@")) {
       flushPending();
+      const nums = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      oldLine = nums ? parseInt(nums[1], 10) : 0;
+      newLine = nums ? parseInt(nums[2], 10) : 0;
       const ctxMatch = line.match(/@@ .+? @@\s*(.+)/);
       hunkContext = ctxMatch ? ctxMatch[1].trim() : null;
     } else if (line.startsWith("-") && !line.startsWith("---")) {
       if (pendingAdded.length > 0) flushPending();
+      if (pendingRemoved.length === 0) removeStart = oldLine;
       pendingRemoved.push(line.slice(1));
+      oldLine++;
     } else if (line.startsWith("+") && !line.startsWith("+++")) {
+      if (pendingAdded.length === 0) addStart = newLine;
       pendingAdded.push(line.slice(1));
+      newLine++;
     } else {
       flushPending();
+      if (!line.startsWith("\\")) { oldLine++; newLine++; }
     }
   }
   flushPending();
@@ -178,12 +193,18 @@ function printTUI(commit, substitutions, opts) {
         console.log(label);
       }
 
-      for (const l of sub.removed) {
-        console.log(chalk.red(`  │ − ${l}`));
+      const gutterW = Math.max(
+        String(sub.removedStart + sub.removed.length - 1).length,
+        String(sub.addedStart + sub.added.length - 1).length
+      );
+
+      for (let i = 0; i < sub.removed.length; i++) {
+        const ln = String(sub.removedStart + i).padStart(gutterW);
+        console.log(chalk.red(`  │ ${chalk.dim(ln)} − ${sub.removed[i]}`));
       }
-      console.log(chalk.yellow(`  │ ${"▼".repeat(3)}`));
-      for (const l of sub.added) {
-        console.log(chalk.green(`  │ + ${l}`));
+      for (let i = 0; i < sub.added.length; i++) {
+        const ln = String(sub.addedStart + i).padStart(gutterW);
+        console.log(chalk.green(`  │ ${chalk.dim(ln)} + ${sub.added[i]}`));
       }
       console.log(chalk.dim("  └" + "┄".repeat(20)));
     }
@@ -201,6 +222,54 @@ function printTUI(commit, substitutions, opts) {
     `${chalk.red(`−${totalR}`)} removed  ${chalk.green(`+${totalA}`)} added`
   );
   console.log("");
+}
+
+// ── Plain text output (no colors, no box drawing) ────────────────────
+
+function printPlain(commit, substitutions) {
+  const shortHash = commit.hash.slice(0, 8);
+  const dateStr = commit.date.split(" ").slice(0, 2).join(" ");
+
+  console.log(`commit ${shortHash}`);
+  console.log(`message: ${commit.message}`);
+  console.log(`author: ${commit.author} <${commit.email}>`);
+  console.log(`date: ${dateStr}`);
+
+  if (substitutions.length === 0) {
+    console.log("\nNo substitutions (only pure additions or deletions).");
+    return;
+  }
+
+  const byFile = {};
+  for (const sub of substitutions) {
+    if (!byFile[sub.file]) byFile[sub.file] = [];
+    byFile[sub.file].push(sub);
+  }
+
+  let changeNum = 0;
+  const totalChanges = substitutions.length;
+
+  for (const [file, subs] of Object.entries(byFile)) {
+    console.log(`\nfile: ${file}`);
+
+    for (const sub of subs) {
+      changeNum++;
+      const header = `[change ${changeNum}/${totalChanges}]` +
+        (sub.context ? ` in ${sub.context}` : "");
+      console.log(header);
+
+      for (let i = 0; i < sub.removed.length; i++) {
+        console.log(`  ${sub.removedStart + i} - ${sub.removed[i]}`);
+      }
+      for (let i = 0; i < sub.added.length; i++) {
+        console.log(`  ${sub.addedStart + i} + ${sub.added[i]}`);
+      }
+    }
+  }
+
+  const totalR = substitutions.reduce((s, b) => s + b.removed.length, 0);
+  const totalA = substitutions.reduce((s, b) => s + b.added.length, 0);
+  console.log(`\n${totalChanges} substitution(s), ${totalR} lines removed, ${totalA} lines added`);
 }
 
 // ── JSON output ──────────────────────────────────────────────────────
@@ -231,8 +300,8 @@ function printJSON(commit, substitutions) {
       path: file,
       substitutions: subs.map((s) => ({
         context: s.context || null,
-        removed: s.removed,
-        added: s.added,
+        removed: { start_line: s.removedStart, lines: s.removed },
+        added: { start_line: s.addedStart, lines: s.added },
       })),
     })),
   };
@@ -263,6 +332,8 @@ function run(commitHash, directory, opts) {
 
   if (opts.json) {
     printJSON(commit, substitutions);
+  } else if (opts.plain) {
+    printPlain(commit, substitutions);
   } else {
     printTUI(commit, substitutions, opts);
   }
