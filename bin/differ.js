@@ -19,6 +19,20 @@ program
   .option("--plain", "Plain text output with no colors or box drawing (LLM-friendly)")
   .action(run);
 
+// ── File exclusions ──────────────────────────────────────────────────
+// Add extensions or glob patterns here to skip files that produce
+// noisy or meaningless diffs (binary assets, generated code, etc.).
+
+const EXCLUDED_EXTENSIONS = [
+  ".svg",
+];
+
+function isExcluded(filePath) {
+  if (!filePath) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  return EXCLUDED_EXTENSIONS.includes(ext);
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function git(cmd, cwd) {
@@ -89,6 +103,8 @@ function parseDiff(rawDiff) {
       const match = line.match(/b\/(.+)$/);
       currentFile = match ? match[1] : "unknown";
       hunkContext = null;
+    } else if (isExcluded(currentFile)) {
+      continue;
     } else if (line.startsWith("@@")) {
       flushPending();
       const nums = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
