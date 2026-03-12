@@ -1,0 +1,19 @@
+{
+  "name": "differ",
+  "version": "1.0.0",
+  "description": "CLI to analyze git diffs — what was removed and added, commit by commit",
+  "main": "bin/differ.js",
+  "bin": {
+    "differ": "./bin/differ.js"
+  },
+  "scripts": {
+    "start": "node bin/differ.js"
+  },
+  "keywords": ["git", "diff", "cli"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^14.0.3"
+  }
+}
